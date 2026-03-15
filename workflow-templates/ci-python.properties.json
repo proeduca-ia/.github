@@ -1,0 +1,6 @@
+{
+  "name": "CI — Python (ia-service-template-python)",
+  "description": "Pipeline de CI estándar para microservicios Python del departamento de IA.",
+  "iconName": "python",
+  "categories": ["Python", "Testing"]
+}

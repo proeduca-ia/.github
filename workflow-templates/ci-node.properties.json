@@ -1,0 +1,6 @@
+{
+  "name": "CI — Node.js (ia-service-template-node)",
+  "description": "Pipeline de CI estándar para microservicios Node.js/TypeScript del departamento de IA.",
+  "iconName": "nodejs",
+  "categories": ["Node", "TypeScript", "Testing"]
+}
