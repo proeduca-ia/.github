@@ -5,8 +5,8 @@ name: GSD → GitHub Issues Sync
 
 on:
   push:
-    branches: [main, develop]
-    paths: [".planning/**/PLAN.md"]
+    branches: [main, develop, dev]
+    paths: [".planning/**/*PLAN.md"]
 
   workflow_dispatch:
     inputs:
