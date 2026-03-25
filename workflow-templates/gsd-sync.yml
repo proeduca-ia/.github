@@ -1,0 +1,29 @@
+name: GSD → GitHub Issues Sync
+
+# Se activa automáticamente cuando GSD genera o actualiza un PLAN.md.
+# El script y la lógica viven en proeduca-ia/.github — no necesitas copiar nada.
+
+on:
+  push:
+    branches: [main, develop]
+    paths: [".planning/**/PLAN.md"]
+
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Fase a sincronizar (ej. phase-1). Vacío = todas."
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry-run (no crea issues reales)"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  sync:
+    uses: proeduca-ia/.github/.github/workflows/gsd-sync-github.yml@main
+    with:
+      phase: ${{ inputs.phase || '' }}
+      dry_run: ${{ inputs.dry_run || false }}
+    secrets: inherit

@@ -1,0 +1,6 @@
+{
+  "name": "GSD → GitHub Issues Sync",
+  "description": "Sincroniza automáticamente los PLAN.md de GSD con GitHub Issues, Milestones y Labels.",
+  "iconName": "octicon-sync",
+  "categories": ["GSD", "Project Management"]
+}

@@ -1,0 +1,91 @@
+name: GSD → GitHub Issues Sync (reusable)
+
+# Workflow reutilizable — se invoca desde cualquier repo de la org.
+# Los repos individuales solo necesitan un caller de ~10 líneas.
+#
+# Uso desde otro repo:
+#   jobs:
+#     sync:
+#       uses: proeduca-ia/.github/.github/workflows/gsd-sync-github.yml@main
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      phase:
+        description: "Sincronizar solo esta fase (ej. phase-1). Vacío = todas."
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Dry-run: muestra qué haría sin crear issues reales."
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: gsd-sync-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync-issues:
+    name: Sync PLAN.md → Issues
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo del desarrollador
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Obtener script desde proeduca-ia/.github
+        uses: actions/checkout@v4
+        with:
+          repository: proeduca-ia/.github
+          path: .gsd-tools
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sync issues
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.phase }}" ]; then
+            ARGS="$ARGS --phase ${{ inputs.phase }}"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python .gsd-tools/scripts/gsd_sync_issues.py $ARGS
+
+      - name: Commit state file
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet .github/gsd-issues-state.json 2>/dev/null; then
+            echo "Sin cambios en el estado."
+          else
+            git add .github/gsd-issues-state.json
+            git commit -m "chore: update gsd-issues-state.json [skip ci]"
+            git push
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### GSD Sync" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repo:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Ref:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f .github/gsd-issues-state.json ]; then
+            COUNT=$(python -c "import json; d=json.load(open('.github/gsd-issues-state.json')); print(len(d.get('issues', {})))")
+            echo "- **Issues tracked:** ${COUNT}" >> $GITHUB_STEP_SUMMARY
+          fi
