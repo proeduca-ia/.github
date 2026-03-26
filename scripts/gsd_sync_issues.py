@@ -334,6 +334,24 @@ class GitHubAPI:
             payload["milestone"] = milestone_number
         return self._request("PATCH", f"/repos/{self.repo}/issues/{number}", payload)
 
+    def close_issue(self, number: int, reason: str = "not_planned") -> dict:
+        """Cierra un issue. reason: 'completed' | 'not_planned'."""
+        if self.dry_run:
+            print(f"  [DRY-RUN] Cerraría issue #{number} ({reason})")
+            return {"number": number}
+        return self._request("PATCH", f"/repos/{self.repo}/issues/{number}", {
+            "state": "closed",
+            "state_reason": reason,
+        })
+
+    def comment_issue(self, number: int, body: str) -> dict:
+        if self.dry_run:
+            print(f"  [DRY-RUN] Comentaría issue #{number}")
+            return {}
+        return self._request("POST",
+                             f"/repos/{self.repo}/issues/{number}/comments",
+                             {"body": body})
+
 
 # ---------------------------------------------------------------------------
 # Generación del cuerpo del issue
@@ -453,15 +471,21 @@ def sync(api: GitHubAPI, plans: list, state: dict) -> dict:
 
             if global_id in issues_state:
                 existing = issues_state[global_id]
-                if existing.get("title") != task.issue_title:
-                    api.update_issue(
-                        existing["issue_number"],
-                        task.issue_title, body, labels, ms_number
-                    )
-                    issues_state[global_id]["title"] = task.issue_title
-                    print(f"  Issue actualizado #{existing['issue_number']}: {task.issue_title}")
+                # Siempre actualizar el body (el PLAN puede haber cambiado)
+                api.update_issue(
+                    existing["issue_number"],
+                    task.issue_title, body, labels, ms_number
+                )
+                if existing.get("status") == "closed":
+                    # Reabrir si la task vuelve a aparecer
+                    api._request("PATCH",
+                                 f"/repos/{api.repo}/issues/{existing['issue_number']}",
+                                 {"state": "open"})
+                    issues_state[global_id]["status"] = "open"
+                    print(f"  Issue reabierto #{existing['issue_number']}: {task.issue_title}")
                 else:
-                    print(f"  Issue ya existe #{existing['issue_number']}: {task.task_id}")
+                    issues_state[global_id]["title"] = task.issue_title
+                    print(f"  Issue actualizado #{existing['issue_number']}: {task.task_id}")
             else:
                 result = api.create_issue(task.issue_title, body, labels, ms_number)
                 issues_state[global_id] = {
@@ -472,6 +496,23 @@ def sync(api: GitHubAPI, plans: list, state: dict) -> dict:
                     "plan_id": task.plan_id,
                 }
                 print(f"  Issue creado #{result['number']}: {task.issue_title}")
+
+    # Cerrar issues cuya task ya no existe en ningún PLAN.md
+    current_global_ids = {t.global_id for p in plans for t in p.tasks}
+    for global_id, info in list(issues_state.items()):
+        if global_id not in current_global_ids and info.get("status") != "closed":
+            # Solo cerrar si la fase de este issue está en los plans procesados
+            issue_phase = info.get("phase", "")
+            phases_in_sync = {p.phase_slug for p in plans}
+            if issue_phase in phases_in_sync:
+                api.comment_issue(
+                    info["issue_number"],
+                    "Task eliminada del PLAN.md — cerrando issue.\n\n"
+                    f"> `{global_id}` ya no aparece en los planes de la fase."
+                )
+                api.close_issue(info["issue_number"], reason="not_planned")
+                issues_state[global_id]["status"] = "closed"
+                print(f"  Issue cerrado #{info['issue_number']}: {global_id} (task eliminada)")
 
     state["issues"] = issues_state
     return state
