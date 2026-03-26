@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-gsd_sync_issues.py — Sincroniza los PLAN.md de GSD con GitHub Issues.
+gsd_sync_issues.py — Sincroniza PLAN.md y VERIFICATION.md de GSD con GitHub Issues.
+
+Modos:
+    sync    — Crea/actualiza issues desde *-PLAN.md (default)
+    close   — Cierra issues de planes verificados en *-VERIFICATION.md
 
 Uso:
-    python scripts/gsd_sync_issues.py [opciones]
-
-Opciones:
-    --dry-run       Muestra qué haría sin llamar a la API
-    --phase FASE    Sincroniza solo una fase (nombre del directorio de fase)
+    python scripts/gsd_sync_issues.py sync  [--dry-run] [--phase FASE]
+    python scripts/gsd_sync_issues.py close [--dry-run] [--phase FASE]
 
 Variables de entorno requeridas:
     GITHUB_TOKEN    Token con permisos: issues:write, metadata:read
@@ -20,7 +21,10 @@ Formato GSD soportado:
     .planning/phases/{phase-slug}/{NN}-{PP}-PLAN.md
     - YAML frontmatter: phase, plan, wave, depends_on, requirements, must_haves
     - XML tasks: <task type="auto"><name>...</name>...</task>
-    Tambien soporta formato legacy: .planning/{phase-dir}/PLAN.md
+
+    .planning/phases/{phase-slug}/{NN}-VERIFICATION.md
+    - YAML frontmatter: phase, status (passed/failed), score
+    - Per-plan artifact tables: ### Plan NN Artifacts
 """
 
 import os
@@ -344,6 +348,15 @@ class GitHubAPI:
             "state_reason": reason,
         })
 
+    def close_milestone(self, number: int) -> dict:
+        """Cierra un milestone."""
+        if self.dry_run:
+            print(f"  [DRY-RUN] Cerraría milestone #{number}")
+            return {"number": number}
+        return self._request("PATCH", f"/repos/{self.repo}/milestones/{number}", {
+            "state": "closed",
+        })
+
     def comment_issue(self, number: int, body: str) -> dict:
         if self.dry_run:
             print(f"  [DRY-RUN] Comentaría issue #{number}")
@@ -519,16 +532,146 @@ def sync(api: GitHubAPI, plans: list, state: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Parser de VERIFICATION.md
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PlanVerification:
+    plan_num: str       # "01", "02", etc.
+    verified: bool      # True si todos los artifacts son VERIFIED
+
+
+@dataclass
+class PhaseVerification:
+    phase_slug: str
+    phase_number: str
+    status: str         # "passed" | "failed"
+    score: str
+    plans: list         # list[PlanVerification]
+
+    @property
+    def all_plans_verified(self) -> bool:
+        return all(p.verified for p in self.plans)
+
+
+def parse_verification_file(verification_path: Path) -> Optional[PhaseVerification]:
+    """Parsea un *-VERIFICATION.md y devuelve el estado de verificación por plan."""
+    content = verification_path.read_text(encoding='utf-8')
+    fm = _parse_frontmatter(content)
+    if not fm:
+        return None
+
+    phase_slug = fm.get('phase', verification_path.parent.name)
+    status = fm.get('status', 'unknown')
+    score = fm.get('score', '')
+    phase_number = phase_slug.split('-')[0] if '-' in phase_slug else '00'
+
+    # Extraer verificación por plan desde las secciones "### Plan NN Artifacts"
+    plans = []
+    plan_sections = re.finditer(
+        r'### Plan (\d+) Artifacts\s*\n(.*?)(?=### |\Z)',
+        content,
+        re.DOTALL
+    )
+    for section in plan_sections:
+        plan_num = section.group(1).zfill(2)
+        section_body = section.group(2)
+
+        # Parsear filas de la tabla: | artifact | VERIFIED/FAILED | details |
+        rows = re.findall(r'\|\s*`[^`]+`\s*\|\s*(\w+)', section_body)
+        if rows:
+            all_verified = all('VERIFIED' in r.upper() for r in rows)
+        else:
+            # Si no hay filas parseables, confiar en el status global
+            all_verified = (status == 'passed')
+
+        plans.append(PlanVerification(plan_num=plan_num, verified=all_verified))
+
+    # Si no se encontraron secciones por plan pero el status es passed,
+    # consideramos toda la fase como verificada
+    if not plans and status == 'passed':
+        # Buscar qué planes existen en el directorio
+        phase_dir = verification_path.parent
+        for plan_file in sorted(phase_dir.glob("*-PLAN.md")):
+            plan_prefix = plan_file.stem.replace('-PLAN', '')
+            plan_num = plan_prefix.split('-')[1] if '-' in plan_prefix else plan_prefix
+            plans.append(PlanVerification(plan_num=plan_num, verified=True))
+
+    return PhaseVerification(
+        phase_slug=phase_slug,
+        phase_number=phase_number,
+        status=status,
+        score=score,
+        plans=plans,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cierre de issues verificados
+# ---------------------------------------------------------------------------
+
+def close_verified(api: GitHubAPI, verifications: list, state: dict) -> dict:
+    """Cierra issues cuyo plan ha sido verificado en VERIFICATION.md."""
+    issues_state = state.get("issues", {})
+    closed_count = 0
+
+    for verif in verifications:
+        verified_plan_ids = set()
+        for pv in verif.plans:
+            if pv.verified:
+                verified_plan_ids.add(f"{verif.phase_number}-{pv.plan_num}")
+
+        if not verified_plan_ids:
+            print(f"  Phase {verif.phase_number}: sin planes verificados")
+            continue
+
+        print(f"  Phase {verif.phase_number}: planes verificados → {sorted(verified_plan_ids)}")
+
+        # Cerrar issues de planes verificados
+        for global_id, info in list(issues_state.items()):
+            plan_id = info.get("plan_id", "")
+            if plan_id in verified_plan_ids and info.get("status") != "closed":
+                api.comment_issue(
+                    info["issue_number"],
+                    f"Verificado en `{verif.phase_slug}/{verif.phase_number}-VERIFICATION.md`\n\n"
+                    f"**Status:** {verif.status} · **Score:** {verif.score}\n\n"
+                    f"Plan `{plan_id}` verificado — cerrando issue."
+                )
+                api.close_issue(info["issue_number"], reason="completed")
+                issues_state[global_id]["status"] = "closed"
+                closed_count += 1
+                print(f"    Issue cerrado #{info['issue_number']}: {info.get('title', global_id)} (verificado)")
+
+        # Si todos los planes de la fase están verificados, cerrar el milestone
+        if verif.all_plans_verified:
+            ms_title = f"Phase {verif.phase_number}: {_phase_title_from_slug(verif.phase_slug)}"
+            milestones = api.get_milestones()
+            if ms_title in milestones:
+                ms_number = milestones[ms_title]['number']
+                api.close_milestone(ms_number)
+                print(f"    Milestone cerrado: {ms_title}")
+            else:
+                print(f"    Milestone no encontrado: {ms_title}")
+
+    state["issues"] = issues_state
+    print(f"\n  Total issues cerrados: {closed_count}")
+    return state
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sincroniza PLAN.md de GSD con GitHub Issues"
+        description="Sincroniza PLAN.md y VERIFICATION.md de GSD con GitHub Issues"
     )
+    parser.add_argument("mode", nargs="?", default="sync",
+                        choices=["sync", "close"],
+                        help="sync = crear/actualizar issues; close = cerrar verificados")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--phase",
-                        help="Sincronizar solo esta fase (slug del directorio)")
+                        help="Solo esta fase (slug del directorio)")
     parser.add_argument("--repo-root", default=".")
     args = parser.parse_args()
 
@@ -550,56 +693,86 @@ def main():
         print(f"ERROR: No existe {planning_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Buscar PLAN.md en ambos formatos
-    plan_files = sorted(planning_dir.glob("phases/**/*-PLAN.md"))
-    plan_files += sorted(planning_dir.glob("**/PLAN.md"))
-
-    # Eliminar duplicados
-    seen = set()
-    unique = []
-    for pf in plan_files:
-        if pf not in seen:
-            seen.add(pf)
-            unique.append(pf)
-    plan_files = unique
-
-    if not plan_files:
-        print("No se encontraron archivos PLAN.md en .planning/")
-        sys.exit(0)
-
-    # Parsear
-    all_plans = []
-    for pf in plan_files:
-        phase_dir = pf.parent.name
-        if args.phase and phase_dir != args.phase and not phase_dir.startswith(args.phase):
-            continue
-        print(f"\nParsing: {pf.relative_to(repo_root)}")
-        plan = parse_plan_file(pf, repo_root)
-        if plan:
-            print(f"  Plan {plan.plan_id}: {len(plan.tasks)} tasks, wave {plan.wave}, reqs: {plan.requirements}")
-            all_plans.append(plan)
-        else:
-            print(f"  (sin frontmatter, ignorado)")
-
-    all_tasks = [t for p in all_plans for t in p.tasks]
-    if not all_tasks:
-        print("\nNo se encontraron tasks para sincronizar.")
-        sys.exit(0)
-
     api = GitHubAPI(token=token, repo=repo, dry_run=args.dry_run)
     state = load_state(state_path)
 
-    print(f"\nSincronizando {len(all_tasks)} tasks de {len(all_plans)} planes con {repo}...")
-    if args.dry_run:
-        print("(modo dry-run)\n")
+    if args.mode == "close":
+        # --- Modo close: cerrar issues de planes verificados ---
+        verif_files = sorted(planning_dir.glob("phases/**/*-VERIFICATION.md"))
+        if not verif_files:
+            print("No se encontraron archivos VERIFICATION.md")
+            sys.exit(0)
 
-    state = sync(api, all_plans, state)
+        verifications = []
+        for vf in verif_files:
+            phase_dir = vf.parent.name
+            if args.phase and phase_dir != args.phase and not phase_dir.startswith(args.phase):
+                continue
+            print(f"\nParsing: {vf.relative_to(repo_root)}")
+            verif = parse_verification_file(vf)
+            if verif:
+                print(f"  Phase {verif.phase_number}: status={verif.status}, score={verif.score}, "
+                      f"{len(verif.plans)} planes")
+                verifications.append(verif)
+            else:
+                print(f"  (sin frontmatter, ignorado)")
+
+        if not verifications:
+            print("\nNo se encontraron verificaciones para procesar.")
+            sys.exit(0)
+
+        print(f"\nCerrando issues verificados en {repo}...")
+        if args.dry_run:
+            print("(modo dry-run)\n")
+
+        state = close_verified(api, verifications, state)
+
+    else:
+        # --- Modo sync: crear/actualizar issues desde PLAN.md ---
+        plan_files = sorted(planning_dir.glob("phases/**/*-PLAN.md"))
+        plan_files += sorted(planning_dir.glob("**/PLAN.md"))
+
+        seen = set()
+        unique = []
+        for pf in plan_files:
+            if pf not in seen:
+                seen.add(pf)
+                unique.append(pf)
+        plan_files = unique
+
+        if not plan_files:
+            print("No se encontraron archivos PLAN.md en .planning/")
+            sys.exit(0)
+
+        all_plans = []
+        for pf in plan_files:
+            phase_dir = pf.parent.name
+            if args.phase and phase_dir != args.phase and not phase_dir.startswith(args.phase):
+                continue
+            print(f"\nParsing: {pf.relative_to(repo_root)}")
+            plan = parse_plan_file(pf, repo_root)
+            if plan:
+                print(f"  Plan {plan.plan_id}: {len(plan.tasks)} tasks, wave {plan.wave}, reqs: {plan.requirements}")
+                all_plans.append(plan)
+            else:
+                print(f"  (sin frontmatter, ignorado)")
+
+        all_tasks = [t for p in all_plans for t in p.tasks]
+        if not all_tasks:
+            print("\nNo se encontraron tasks para sincronizar.")
+            sys.exit(0)
+
+        print(f"\nSincronizando {len(all_tasks)} tasks de {len(all_plans)} planes con {repo}...")
+        if args.dry_run:
+            print("(modo dry-run)\n")
+
+        state = sync(api, all_plans, state)
 
     if not args.dry_run:
         save_state(state_path, state)
         print(f"\nEstado guardado en {state_path.relative_to(repo_root)}")
 
-    print("\nSincronizacion completada.")
+    print(f"\n{'Cierre' if args.mode == 'close' else 'Sincronizacion'} completada.")
 
 
 if __name__ == "__main__":

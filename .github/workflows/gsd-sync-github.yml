@@ -7,11 +7,18 @@ name: GSD → GitHub Issues Sync (reusable)
 #   jobs:
 #     sync:
 #       uses: proeduca-ia/.github/.github/workflows/gsd-sync-github.yml@main
+#       with:
+#         mode: sync   # o "close" para cerrar issues verificados
 #       secrets: inherit
 
 on:
   workflow_call:
     inputs:
+      mode:
+        description: "sync = crear/actualizar issues; close = cerrar verificados"
+        required: false
+        default: "sync"
+        type: string
       phase:
         description: "Sincronizar solo esta fase (ej. phase-1). Vacío = todas."
         required: false
@@ -29,7 +36,7 @@ concurrency:
 
 jobs:
   sync-issues:
-    name: Sync PLAN.md → Issues
+    name: "GSD ${{ inputs.mode }}: PLAN.md ↔ Issues"
     runs-on: ubuntu-latest
 
     steps:
@@ -51,12 +58,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Sync issues
+      - name: Run GSD sync (${{ inputs.mode }})
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           GITHUB_REPO: ${{ github.repository }}
         run: |
-          ARGS=""
+          ARGS="${{ inputs.mode }}"
           if [ -n "${{ inputs.phase }}" ]; then
             ARGS="$ARGS --phase ${{ inputs.phase }}"
           fi
@@ -75,17 +82,19 @@ jobs:
             echo "Sin cambios en el estado."
           else
             git add .github/gsd-issues-state.json
-            git commit -m "chore: update gsd-issues-state.json [skip ci]"
+            git commit -m "chore: update gsd-issues-state.json (${{ inputs.mode }}) [skip ci]"
             git push
           fi
 
       - name: Summary
         if: always()
         run: |
-          echo "### GSD Sync" >> $GITHUB_STEP_SUMMARY
+          echo "### GSD ${{ inputs.mode }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Repo:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Ref:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mode:** ${{ inputs.mode }}" >> $GITHUB_STEP_SUMMARY
           if [ -f .github/gsd-issues-state.json ]; then
-            COUNT=$(python -c "import json; d=json.load(open('.github/gsd-issues-state.json')); print(len(d.get('issues', {})))")
-            echo "- **Issues tracked:** ${COUNT}" >> $GITHUB_STEP_SUMMARY
+            TOTAL=$(python -c "import json; d=json.load(open('.github/gsd-issues-state.json')); print(len(d.get('issues', {})))")
+            CLOSED=$(python -c "import json; d=json.load(open('.github/gsd-issues-state.json')); print(sum(1 for i in d.get('issues', {}).values() if i.get('status')=='closed'))")
+            echo "- **Issues tracked:** ${TOTAL} (${CLOSED} closed)" >> $GITHUB_STEP_SUMMARY
           fi

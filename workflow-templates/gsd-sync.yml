@@ -1,29 +1,60 @@
 name: GSD → GitHub Issues Sync
 
-# Se activa automáticamente cuando GSD genera o actualiza un PLAN.md.
+# Se activa automáticamente cuando GSD genera o actualiza un PLAN.md o VERIFICATION.md.
 # El script y la lógica viven en proeduca-ia/.github — no necesitas copiar nada.
 
 on:
   push:
     branches: [main, develop, dev]
-    paths: [".planning/**/*PLAN.md"]
+    paths:
+      - ".planning/**/*PLAN.md"
+      - ".planning/**/*VERIFICATION.md"
 
   workflow_dispatch:
     inputs:
+      mode:
+        description: "sync = crear/actualizar issues; close = cerrar verificados"
+        required: false
+        default: "sync"
+        type: choice
+        options:
+          - sync
+          - close
       phase:
         description: "Fase a sincronizar (ej. phase-1). Vacío = todas."
         required: false
         default: ""
       dry_run:
-        description: "Dry-run (no crea issues reales)"
+        description: "Dry-run (no crea/cierra issues reales)"
         required: false
         default: false
         type: boolean
 
 jobs:
+  detect-mode:
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.detect.outputs.mode }}
+    steps:
+      - name: Detect sync mode from changed files
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ inputs.mode || 'sync' }}" >> "$GITHUB_OUTPUT"
+          else
+            CHANGED="${{ join(github.event.commits.*.modified, ' ') }} ${{ join(github.event.commits.*.added, ' ') }}"
+            if echo "$CHANGED" | grep -q "VERIFICATION.md"; then
+              echo "mode=close" >> "$GITHUB_OUTPUT"
+            else
+              echo "mode=sync" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
   sync:
+    needs: detect-mode
     uses: proeduca-ia/.github/.github/workflows/gsd-sync-github.yml@main
     with:
+      mode: ${{ needs.detect-mode.outputs.mode }}
       phase: ${{ inputs.phase || '' }}
       dry_run: ${{ inputs.dry_run || false }}
     secrets: inherit
